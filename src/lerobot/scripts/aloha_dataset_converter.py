@@ -85,7 +85,7 @@ def convert_aloha_folder_to_lerobot(
     task_description: str,
     output_dir: str = "data",
     fps: int = 50,
-    max_workers: int = 4,
+    max_workers: int = 8,  # Increased default workers for faster processing
     file_pattern: str = "episode_*.hdf5",
     overwrite: bool = False,
 ):
@@ -105,11 +105,21 @@ def convert_aloha_folder_to_lerobot(
     
     # Monkey-patch encode_video_frames to use H.264 instead of AV1 for better torchcodec compatibility
     original_encode_video_frames = encode_video_frames
-    def patched_encode_video_frames(*args, **kwargs):
-        # Override vcodec to use libx264 (H.264) instead of libsvtav1 (AV1)
-        kwargs.setdefault('vcodec', 'libx264')  # Use H.264 instead of AV1
-        kwargs.setdefault('crf', 23)  # Slightly better quality for H.264
-        return original_encode_video_frames(*args, **kwargs)
+    def patched_encode_video_frames(imgs_dir, video_path, fps, vcodec="h264", pix_fmt="yuv420p", g=1, crf=28, fast_decode=0, log_level=None, overwrite=False):
+        # Force H.264 codec with faster settings for speed
+        print(f"Encoding video with codec: {vcodec} (optimized for speed)")
+        return original_encode_video_frames(
+            imgs_dir=imgs_dir, 
+            video_path=video_path, 
+            fps=fps, 
+            vcodec=vcodec,  # H.264 for torchcodec compatibility
+            pix_fmt=pix_fmt, 
+            g=g,  # Smaller keyframe interval for faster encoding
+            crf=crf,  # Higher CRF = lower quality but faster encoding
+            fast_decode=fast_decode, 
+            log_level=log_level, 
+            overwrite=overwrite
+        )
     
     # Apply the patch globally
     import lerobot.datasets.video_utils as video_utils_module
@@ -208,10 +218,13 @@ def convert_aloha_folder_to_lerobot(
         use_videos=True,
     )
 
-    # Start image writer for efficient video processing
+    # Start image writer for efficient video processing with batch encoding
     dataset.start_image_writer(
         num_processes=0, num_threads=max_workers  # Use threads only
     )
+    
+    # Use batch encoding for much faster video processing (encode 10 episodes at once)
+    dataset.batch_encoding_size = 10
 
     # Process all episodes
     total_frames = 0
@@ -231,7 +244,7 @@ def convert_aloha_folder_to_lerobot(
 
         # Process frames for this episode
         for frame_idx in range(episode_length):
-            if frame_idx % 50 == 0 or frame_idx == episode_length - 1:
+            if frame_idx % 200 == 0 or frame_idx == episode_length - 1:
                 print(f"  Processing frame {frame_idx + 1}/{episode_length}")
 
             # Decompress images for this frame
@@ -292,8 +305,8 @@ if __name__ == "__main__":
             "use left arm to open the cover of the pot, "
             "use right arm pick up the sponge and put it into the pot"
         ),
-        output_dir="/home/aloha/Disk2/lerobot_dataset/aloha_put_sponge_into_pot",  # Different name
+        output_dir="/home/aloha/Disk2/lerobot_dataset/aloha_put_sponge_into_pot",  # H.264 version
         fps=50,
-        max_workers=4,
+        max_workers=12,  # Use more workers for faster conversion
         file_pattern="episode_*.hdf5",
     )
