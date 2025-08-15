@@ -299,14 +299,13 @@ def convert_aloha_folder_to_lerobot(
 if __name__ == "__main__":
     # Example usage - convert entire folder
     convert_aloha_folder_to_lerobot(
-        folder_path="/home/aloha/Disk2/aloha_dataset/aloha_put_sponge_into_pot",
-        repo_id="local/aloha_put_sponge_into_pot",
+        folder_path="/home/aloha/Disk2/aloha_dataset/aloha_open_zipper_bag",
+        repo_id="local/aloha_open_zipper_bag",
         task_description=(
-            "use left arm to open the cover of the pot, "
-            "use right arm pick up the sponge and put it into the pot"
+            "Use the left gripper to pick up and hold the zipper bag. Use the right gripper to grasp the zipper and slide it to the right to open the bag."
         ),
-        output_dir="/home/aloha/Disk2/lerobot_dataset/aloha_put_sponge_into_pot",  # H.264 version
+        output_dir="/home/aloha/Disk2/lerobot_dataset/aloha_open_zipper_bag",  # H.264 version
         fps=50,
-        max_workers=12,  # Use more workers for faster conversion
+        max_workers=6,  # Use more workers for faster conversion
         file_pattern="episode_*.hdf5",
     )
