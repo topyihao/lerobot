@@ -477,7 +477,9 @@ class PI0FAST(nn.Module):
                 param.data = param.data.to(dtype=torch_precision)
         self.set_requires_grad()
         self.image_keys = self.config.image_features.keys()
-        self.ignore_index = self.pi0_paligemma.config.ignore_index
+        # Some transformers configs (including PaliGemma) may not expose `ignore_index`.
+        # Default to PyTorch's CrossEntropyLoss default ignore index (-100).
+        self.ignore_index = getattr(self.pi0_paligemma.config, "ignore_index", -100)
         self.padding_side = self.config.padding_side
 
     def set_requires_grad(self):
@@ -492,7 +494,19 @@ class PI0FAST(nn.Module):
                     params.requires_grad = False
 
     def embed_tokens(self, tokens: torch.Tensor):
-        return self.pi0_paligemma.language_model.model.embed_tokens(tokens)
+        # Be compatible across transformers versions/shapes:
+        # - Some expose language_model.model.embed_tokens
+        # - Others expose language_model.embed_tokens directly
+        # - Fallback to get_input_embeddings()
+        language_model = getattr(self.pi0_paligemma, "language_model", None)
+        if language_model is not None:
+            inner_model = getattr(language_model, "model", None)
+            if inner_model is not None and hasattr(inner_model, "embed_tokens"):
+                return inner_model.embed_tokens(tokens)
+            if hasattr(language_model, "embed_tokens"):
+                return language_model.embed_tokens(tokens)
+        input_embeddings = self.pi0_paligemma.get_input_embeddings()
+        return input_embeddings(tokens)
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         return self.pi0_paligemma.prepare_inputs_for_generation(*args, **kwargs)

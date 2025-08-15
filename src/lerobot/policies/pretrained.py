@@ -139,7 +139,18 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 )
                 model.to(map_location)
         else:
-            safetensors.torch.load_model(model, model_file, strict=strict, device=map_location)
+            # Use a more robust loading path to avoid strict internal assertions in safetensors.load_model
+            # seen with some checkpoints where computed missing key sets differ.
+            state_dict = safetensors.torch.load_file(model_file, device=map_location)
+            load_info = model.load_state_dict(state_dict, strict=strict)
+            # If not strict, surface warnings to help debugging but do not crash.
+            if not strict:
+                missing = getattr(load_info, "missing_keys", [])
+                unexpected = getattr(load_info, "unexpected_keys", [])
+                if missing:
+                    logging.warning(f"Missing keys while loading checkpoint: {len(missing)} keys (showing first 10): {missing[:10]}")
+                if unexpected:
+                    logging.warning(f"Unexpected keys while loading checkpoint: {len(unexpected)} keys (showing first 10): {unexpected[:10]}")
         return model
 
     @abc.abstractmethod
