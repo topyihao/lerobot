@@ -124,24 +124,65 @@ def apply_action(
     follower_bot_left: InterbotixManipulatorXS,
     follower_bot_right: InterbotixManipulatorXS,
     action: np.ndarray,
-    gripper_command: JointSingleCommand
+    gripper_command: JointSingleCommand,
+    use_smoothing: bool = True,
+    max_joint_step: float = 0.04,
+    max_gripper_step: float = 0.05,
 ):
-    """Apply action to the robots."""
+    """Apply action to the robots.
+
+    If ``use_smoothing`` is True, generate a smoothed intermediate command by
+    limiting per-step movement from the current joint positions to the target
+    action. This avoids large jumps by clamping the change per joint and per
+    gripper at each control iteration.
+    """
     # Split action into left and right arm components
-    left_arm_action = action[:6]
-    left_gripper_action = action[6]
-    right_arm_action = action[7:13]
-    right_gripper_action = action[13]
-    
-    # Unnormalize gripper actions from SmolVLA's normalized output
-    # to actual gripper joint values that the robot expects
-    left_gripper_unnormalized = follower_gripper_joint_unnormalize(left_gripper_action)
-    right_gripper_unnormalized = follower_gripper_joint_unnormalize(right_gripper_action)
-    
+    target_left_arm = action[:6]
+    target_left_gripper_norm = action[6]
+    target_right_arm = action[7:13]
+    target_right_gripper_norm = action[13]
+
+    if use_smoothing:
+        # Current joint positions
+        current_left_arm = np.array(follower_bot_left.core.joint_states.position[:6])
+        current_right_arm = np.array(follower_bot_right.core.joint_states.position[:6])
+
+        # Compute next step for arms with per-joint clamp
+        left_delta = target_left_arm - current_left_arm
+        right_delta = target_right_arm - current_right_arm
+        left_step = np.clip(left_delta, -max_joint_step, max_joint_step)
+        right_step = np.clip(right_delta, -max_joint_step, max_joint_step)
+        next_left_arm = current_left_arm + left_step
+        next_right_arm = current_right_arm + right_step
+
+        # Grippers: work in normalized space; clamp per-step change
+        current_left_gripper_norm = FOLLOWER_GRIPPER_JOINT_NORMALIZE_FN(
+            follower_bot_left.core.joint_states.position[6]
+        )
+        current_right_gripper_norm = FOLLOWER_GRIPPER_JOINT_NORMALIZE_FN(
+            follower_bot_right.core.joint_states.position[6]
+        )
+        left_grip_delta = target_left_gripper_norm - current_left_gripper_norm
+        right_grip_delta = target_right_gripper_norm - current_right_gripper_norm
+        left_grip_step = float(np.clip(left_grip_delta, -max_gripper_step, max_gripper_step))
+        right_grip_step = float(np.clip(right_grip_delta, -max_gripper_step, max_gripper_step))
+        next_left_gripper_norm = float(np.clip(current_left_gripper_norm + left_grip_step, 0.0, 1.0))
+        next_right_gripper_norm = float(np.clip(current_right_gripper_norm + right_grip_step, 0.0, 1.0))
+    else:
+        next_left_arm = target_left_arm
+        next_right_arm = target_right_arm
+        next_left_gripper_norm = target_left_gripper_norm
+        next_right_gripper_norm = target_right_gripper_norm
+
+    # Convert grippers from normalized [0,1] to actual joint values
+    left_gripper_unnormalized = follower_gripper_joint_unnormalize(next_left_gripper_norm)
+    right_gripper_unnormalized = follower_gripper_joint_unnormalize(next_right_gripper_norm)
+
     # Apply arm actions (position control)
-    follower_bot_left.arm.set_joint_positions(left_arm_action, blocking=False)
-    follower_bot_right.arm.set_joint_positions(right_arm_action, blocking=False)
-    
+    follower_bot_left.arm.set_joint_positions(next_left_arm, blocking=False)
+    follower_bot_right.arm.set_joint_positions(next_right_arm, blocking=False)
+
+    # Apply gripper actions
     gripper_command.cmd = left_gripper_unnormalized
     follower_bot_left.gripper.core.pub_single.publish(gripper_command)
 
@@ -161,10 +202,8 @@ def prepare_observation_batch(images: dict, robot_state: np.ndarray, task_descri
             # Convert BGR to RGB and normalize
             if len(image.shape) == 3 and image.shape[2] == 3:
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                # Resize to expected dimensions (480x640)
-                image_resized = cv2.resize(image_rgb, (640, 480))
-                # Convert to tensor and normalize to [0, 1]
-                image_tensor = torch.from_numpy(image_resized).float() / 255.0
+                # Convert to tensor and normalize to [0, 1] (policy handles resizing/padding)
+                image_tensor = torch.from_numpy(image_rgb).float() / 255.0
                 # Rearrange to (1, C, H, W)
                 image_tensor = image_tensor.permute(2, 0, 1).unsqueeze(0)
                 
@@ -200,6 +239,11 @@ def main(args: dict) -> None:
     save_images = args.get('save_images', False)
     save_dir = args.get('save_dir', '/tmp/robot_controller_images')
     control_frequency = args.get('control_frequency', 20.0)  # Hz
+    inference_stride = int(args.get('inference_stride', 5))
+    use_amp = bool(args.get('use_amp', False))
+    use_smoothing = not args.get('disable_smoothing', False)
+    max_joint_step = args.get('max_joint_step', 0.04)
+    max_gripper_step = args.get('max_gripper_step', 0.05)
     
     # Calculate sleep duration from frequency
     control_dt = 1.0 / control_frequency
@@ -207,7 +251,7 @@ def main(args: dict) -> None:
 
     # Load policy (auto-detect type from checkpoint config)
     print("Loading policy...")
-    try: 
+    try:
         cfg = PreTrainedConfig.from_pretrained(model_path)
         policy_cls = get_policy_class(cfg.type)
         policy = policy_cls.from_pretrained(model_path)
@@ -312,21 +356,35 @@ def main(args: dict) -> None:
             try:
                 batch = prepare_observation_batch(images, robot_state, task_description, device)
                 
-                # Get action prediction from SmolVLA
-                with torch.no_grad():
-                    action_tensor = policy.select_action(batch)
-                    action = action_tensor.cpu().numpy().flatten()
-                
-                # Apply the predicted action to the robots
-                # check if control the robot or not. 
-                
-                apply_action(follower_bot_left, follower_bot_right, action, gripper_command)
+                # Get action prediction from SmolVLA every N steps; reuse last otherwise
+                if loop_count % inference_stride == 0:
+                    t0 = time.time()
+                    with torch.inference_mode():
+                        if device == "cuda" and use_amp:
+                            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                action_tensor = policy.select_action(batch)
+                        else:
+                            action_tensor = policy.select_action(batch)
+                    action = action_tensor.detach().cpu().numpy().flatten()
+
+                apply_action(
+                    follower_bot_left,
+                    follower_bot_right,
+                    action,
+                    gripper_command,
+                    use_smoothing=use_smoothing,
+                    max_joint_step=max_joint_step,
+                    max_gripper_step=max_gripper_step,
+                )
                 
                 # Display info every 20 iterations (about 4 times per second)
                 if loop_count % 20 == 0:
                     print(f"🔄 Step {loop_count}")
                     print(f"   State: {robot_state}")
                     print(f"   Action: {action}")
+                    if loop_count % inference_stride == 0:
+                        inf_dt = time.time() - t0
+                        print(f"   🧠 Inference time: {inf_dt:.3f}s (stride={inference_stride}, amp={'on' if (device=='cuda' and use_amp) else 'off'})")
                     
                     # Show gripper values before and after unnormalization
                     left_gripper_norm = action[6]
@@ -388,7 +446,7 @@ def main(args: dict) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='SmolVLA Robot Controller - Control ALOHA robots using SmolVLA policy')
     parser.add_argument(
-        '--model_path',
+        '--model_path', 
         type=str,
         required=False,
         default="/home/allied/Disk2/Yihao/checkpoints/pi_0_fast_put_sponge_into_pot/last/pretrained_model",
@@ -416,6 +474,34 @@ if __name__ == '__main__':
         type=float,
         default=25.0,
         help='Desired control frequency in Hz (default: 20.0)'
+    )
+    parser.add_argument(
+        '--inference_stride',
+        type=int,
+        default=5,
+        help='Call policy every N control steps; reuse previous action otherwise (default: 5)'
+    )
+    parser.add_argument(
+        '--use_amp',
+        action='store_true',
+        help='Enable AMP for CUDA inference'
+    )
+    parser.add_argument(
+        '--disable_smoothing',
+        action='store_true',
+        help='Disable action smoothing (by default smoothing is enabled)'
+    )
+    parser.add_argument(
+        '--max_joint_step',
+        type=float,
+        default=0.04,
+        help='Maximum per-iteration joint change in radians (default: 0.04)'
+    )
+    parser.add_argument(
+        '--max_gripper_step',
+        type=float,
+        default=0.05,
+        help='Maximum per-iteration gripper change in normalized units (default: 0.05)'
     )
     
     args = vars(parser.parse_args())

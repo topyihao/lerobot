@@ -19,6 +19,8 @@ import re
 from glob import glob
 from pathlib import Path
 
+import numpy as np
+import torch
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from termcolor import colored
 
@@ -137,7 +139,18 @@ class WandBLogger:
                 self._wandb.define_metric(new_custom_key, hidden=True)
 
         for k, v in d.items():
-            if not isinstance(v, (int, float, str)):
+            # Convert supported numeric-like types to Python scalars
+            if isinstance(v, torch.Tensor):
+                if v.numel() == 1:
+                    v = v.item()
+                else:
+                    logging.warning(
+                        f'WandB logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'
+                    )
+                    continue
+            elif isinstance(v, np.generic):
+                v = v.item()
+            elif not isinstance(v, (int, float, str)):
                 logging.warning(
                     f'WandB logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'
                 )
@@ -149,6 +162,11 @@ class WandBLogger:
 
             if custom_step_key is not None:
                 value_custom_step = d[custom_step_key]
+                # Sanitize custom step value as well
+                if isinstance(value_custom_step, torch.Tensor) and value_custom_step.numel() == 1:
+                    value_custom_step = value_custom_step.item()
+                elif isinstance(value_custom_step, np.generic):
+                    value_custom_step = value_custom_step.item()
                 data = {f"{mode}/{k}": v, f"{mode}/{custom_step_key}": value_custom_step}
                 self._wandb.log(data)
                 continue

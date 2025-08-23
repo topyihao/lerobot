@@ -368,18 +368,49 @@ def prepare_inputs_for_generation(
         attn_implementation=self.config.text_config._attn_implementation,
     )
     # Overwritten -- custom `position_ids` and `pixel_values` handling
-    model_inputs = self.language_model.prepare_inputs_for_generation(
-        input_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        cache_position=cache_position,
-        use_cache=use_cache,
-        num_logits_to_keep=num_logits_to_keep,
-        token_type_ids=token_type_ids,
-        **kwargs,
-    )
+    # Some transformers versions do not expose prepare_inputs_for_generation on the inner language model
+    # (e.g., GemmaModel). In that case, fall back to the original Paligemma prepare_inputs_for_generation.
+    if hasattr(self, "language_model") and hasattr(self.language_model, "prepare_inputs_for_generation"):
+        model_inputs = self.language_model.prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            use_cache=use_cache,
+            num_logits_to_keep=num_logits_to_keep,
+            token_type_ids=token_type_ids,
+            **kwargs,
+        )
+    else:
+        # Fallback to Paligemma's original method if available
+        if hasattr(self, "_orig_prepare_inputs_for_generation"):
+            model_inputs = self._orig_prepare_inputs_for_generation(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                use_cache=use_cache,
+                num_logits_to_keep=num_logits_to_keep,
+                token_type_ids=token_type_ids,
+                **kwargs,
+            )
+        else:
+            # Last resort: build a minimal dict
+            model_inputs = {
+                "input_ids": input_ids,
+                "past_key_values": past_key_values,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "use_cache": use_cache,
+                "num_logits_to_keep": num_logits_to_keep,
+                "token_type_ids": token_type_ids,
+            }
 
     # Position_ids in Paligemma are 1-indexed
     if model_inputs.get("position_ids") is not None:
@@ -463,6 +494,22 @@ class PI0FAST(nn.Module):
         )
         self.pi0_paligemma = PaliGemmaForConditionalGeneration(config=paligemma_config)
 
+        # Enable gradient checkpointing (optional)
+        if getattr(self.config, "gradient_checkpointing", False):
+            try:
+                # For Transformers >= 4.36
+                self.pi0_paligemma.gradient_checkpointing_enable()
+            except Exception:
+                # Fallback: some versions expose it on inner models
+                language_model = getattr(self.pi0_paligemma, "language_model", None)
+                if language_model is not None and hasattr(language_model, "gradient_checkpointing_enable"):
+                    language_model.gradient_checkpointing_enable()
+
+        # Keep original prepare_inputs_for_generation (for fallback on some transformers versions)
+        if not hasattr(self.pi0_paligemma, "_orig_prepare_inputs_for_generation"):
+            self.pi0_paligemma._orig_prepare_inputs_for_generation = getattr(
+                self.pi0_paligemma, "prepare_inputs_for_generation", None
+            )
         self.pi0_paligemma.prepare_inputs_for_generation = partial(
             prepare_inputs_for_generation, self=self.pi0_paligemma
         )

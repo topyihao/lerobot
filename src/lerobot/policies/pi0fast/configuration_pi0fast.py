@@ -83,6 +83,9 @@ class PI0FASTConfig(PreTrainedConfig):
     # In the original version, tensors of 0s were generated if shapes didn't match for stable decoding.
     relaxed_action_decoding: bool = True
 
+    # Memory-saving options
+    gradient_checkpointing: bool = False
+
     def __post_init__(self):
         super().__post_init__()
 

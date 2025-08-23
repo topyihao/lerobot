@@ -596,12 +596,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
+        # Use explicit features to avoid relying on parquet-embedded metadata that may
+        # include unsupported types (e.g. 'List') for some datasets.
+        features = get_hf_features_from_features(self.features)
+
         if self.episodes is None:
-            path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+            episodes = list(range(self.meta.total_episodes))
+            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
         else:
             files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+
+        # Build the dataset directly from parquet files using explicit features.
+        hf_dataset = datasets.Dataset.from_parquet(files, features=features, split="train")
 
         # TODO(aliberts): hf_dataset.set_format("torch")
         hf_dataset.set_transform(hf_transform_to_torch)
